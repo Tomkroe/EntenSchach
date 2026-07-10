@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { io } from "socket.io-client";
+import { Peer } from "peerjs";
 import Square from "./Square";
 import {
     validateBauer,
@@ -10,96 +10,84 @@ import {
     validateKoenig
 } from "./figures";
 
-const BACKEND_URL = window.location.hostname === "localhost"
-    ? "http://localhost:5001"
-    : "https://DEIN-BACKEND-NAME.onrender.com";
+export default function Board() {
+    // PeerJS States
+    const [peer, setPeer] = useState(null);
+    const [myPeerId, setMyPeerId] = useState("");
+    const [targetPeerId, setTargetPeerId] = useState("");
+    const [conn, setConn] = useState(null);
 
-const socket = io(BACKEND_URL);
-
-function Board() {
-    const [roomCode, setRoomCode] = useState("");
-    const [playerName, setPlayerName] = useState("");
-    const [isJoined, setIsJoined] = useState(false);
-
-    const [activeRooms, setActiveRooms] = useState([]);
-    const [roomPlayers, setRoomPlayers] = useState([]);
-    const [leaderboard, setLeaderboard] = useState([]); // Neu: Bestenliste
-
-    const [board, setBoard] = useState([]);
+    // Spiel-States
+    const [board, setBoard] = useState([
+        ["S_Turm", "S_Springer", "S_Laeufer", "S_Dame", "S_Koenig", "S_Laeufer", "S_Springer", "S_Turm"],
+        ["S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer"],
+        [null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null],
+        [null, null, null, null, null, null, null, null],
+        ["E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer"],
+        ["E_Turm", "E_Springer", "E_Laeufer", "E_Dame", "E_Koenig", "E_Laeufer", "E_Springer", "E_Turm"]
+    ]);
     const [isEntenTurn, setIsEntenTurn] = useState(true);
     const [winner, setWinner] = useState(null);
-    const [myRole, setMyRole] = useState("Zuschauer");
+    const [myRole, setMyRole] = useState("Enten"); // Der Ersteller startet standardmäßig als Enten
 
+    // 1. PeerJS beim Start initialisieren
     useEffect(() => {
-        socket.on("roomListUpdate", (rooms) => {
-            setActiveRooms(rooms);
+        const newPeer = new Peer(undefined, {
+            host: "0.peerjs.com",
+            port: 443,
+            secure: true
         });
 
-        socket.on("leaderboardUpdate", (data) => {
-            setLeaderboard(data);
+        newPeer.on("open", (id) => {
+            setMyPeerId(id);
         });
 
-        socket.on("init", (data) => {
-            setMyRole(data.role);
-            setBoard(data.gameState.board);
-            setIsEntenTurn(data.gameState.isEntenTurn);
-            setWinner(data.gameState.winner);
-            setIsJoined(true);
+        newPeer.on("error", (err) => {
+            console.error("PeerJS Fehler:", err);
         });
 
-        socket.on("playersUpdate", (players) => {
-            setRoomPlayers(players);
+        // Wenn ein Partner sich mit uns verbindet (Wir sind Host -> Enten, er wird Schnecken)
+        newPeer.on("connection", (connection) => {
+            setConn(connection);
+            setMyRole("Enten");
+            setupConnectionListeners(connection);
         });
 
-        socket.on("gameStateUpdate", (data) => {
-            setBoard(data.board);
-            setIsEntenTurn(data.isEntenTurn);
-            setWinner(data.winner);
-        });
-
-        // Beim ersten Laden der Komponente einmal Daten anfordern
-        socket.emit("requestRefresh");
-
+        setPeer(newPeer);
         return () => {
-            socket.off("roomListUpdate");
-            socket.off("leaderboardUpdate");
-            socket.off("init");
-            socket.off("playersUpdate");
-            socket.off("gameStateUpdate");
+            if (newPeer) newPeer.destroy();
         };
     }, []);
 
-    const handleJoinRoom = (e) => {
-        e.preventDefault();
-        if (roomCode.trim() !== "" && playerName.trim() !== "") {
-            socket.emit("joinRoom", { roomCode: roomCode.trim(), playerName: playerName.trim() });
-        } else {
-            alert("Bitte Name und Raum-Code eingeben!");
-        }
+    // 2. Event-Listener für empfangene Daten (Züge des Gegners)
+    const setupConnectionListeners = (connection) => {
+        connection.on("data", (data) => {
+            if (data.type === "MOVE") {
+                setBoard(data.board);
+                setIsEntenTurn(data.isEntenTurn);
+                setWinner(data.winner);
+            } else if (data.type === "RESET") {
+                resetLocalGame();
+            }
+        });
     };
 
-    const joinExistingRoom = (code) => {
-        if (playerName.trim() === "") {
-            alert("Bitte gib zuerst oben deinen Namen ein!");
-            return;
-        }
-        setRoomCode(code);
-        socket.emit("joinRoom", { roomCode: code, playerName: playerName.trim() });
+    // 3. Verbindung zum Ersteller aufbauen (Wir treten bei -> werden Schnecken)
+    const connectToFriend = () => {
+        if (!targetPeerId || !peer) return;
+        const connection = peer.connect(targetPeerId);
+        setConn(connection);
+        setMyRole("Schnecken"); // Wer beitritt, spielt die Schnecken
+        setupConnectionListeners(connection);
     };
 
-    const handleLeaveRoom = () => {
-        socket.emit("leaveRoom");
-        setIsJoined(false);
-        setBoard([]);
-    };
-
-    const triggerRefresh = () => {
-        socket.emit("requestRefresh");
-    };
-
+    // 4. Spiellogik und Senden des Zuges
     const movePiece = (fromRow, fromCol, toRow, toCol) => {
         if (winner || board.length === 0) return;
 
+        // Prüfen, ob man überhaupt am Zug ist
         if (isEntenTurn && myRole !== "Enten") return;
         if (!isEntenTurn && myRole !== "Schnecken") return;
 
@@ -108,9 +96,11 @@ function Board() {
 
         if (!movingPiece) return;
 
+        // Eigene Figuren validieren
         if (movingPiece.startsWith("E_") && !isEntenTurn) return;
         if (movingPiece.startsWith("S_") && isEntenTurn) return;
 
+        // Nicht die eigenen Figuren schlagen
         if (targetPiece && movingPiece.substring(0, 2) === targetPiece.substring(0, 2)) return;
 
         let isValid = false;
@@ -142,108 +132,45 @@ function Board() {
 
         const nextTurn = !isEntenTurn;
 
-        socket.emit("makeMove", {
-            roomCode: roomCode.trim(),
-            newGameState: {
+        // Lokalen Zustand aktualisieren
+        setBoard(newBoard);
+        setIsEntenTurn(nextTurn);
+        setWinner(localWinner);
+
+        // Zug an den Mitspieler senden
+        if (conn) {
+            conn.send({
+                type: "MOVE",
                 board: newBoard,
                 isEntenTurn: nextTurn,
                 winner: localWinner
-            }
-        });
+            });
+        }
+    };
+
+    const resetLocalGame = () => {
+        setBoard([
+            ["S_Turm", "S_Springer", "S_Laeufer", "S_Dame", "S_Koenig", "S_Laeufer", "S_Springer", "S_Turm"],
+            ["S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer", "S_Bauer"],
+            [null, null, null, null, null, null, null, null],
+            [null, null, null, null, null, null, null, null],
+            [null, null, null, null, null, null, null, null],
+            [null, null, null, null, null, null, null, null],
+            ["E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer", "E_Bauer"],
+            ["E_Turm", "E_Springer", "E_Laeufer", "E_Dame", "E_Koenig", "E_Laeufer", "E_Springer", "E_Turm"]
+        ]);
+        setIsEntenTurn(true);
+        setWinner(null);
     };
 
     const resetGame = () => {
-        fetch(`${BACKEND_URL}/api/reset`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ roomCode: roomCode.trim() })
-        });
+        resetLocalGame();
+        if (conn) {
+            conn.send({ type: "RESET" });
+        }
     };
 
-    const entenSpieler = roomPlayers.find(p => p.role === "Enten")?.name || "Wartet...";
-    const schneckenSpieler = roomPlayers.find(p => p.role === "Schnecken")?.name || "Wartet...";
-
-    // --- VIEW 1: Lobby ---
-    if (!isJoined) {
-        return (
-            <div style={{ textAlign: "center", marginTop: "30px", fontFamily: "sans-serif" }}>
-                <h2>🦆 Enten gegen Schnecken 🐌</h2>
-
-                <form onSubmit={handleJoinRoom} style={{ marginBottom: "20px" }}>
-                    <input
-                        type="text"
-                        placeholder="Dein Name..."
-                        value={playerName}
-                        onChange={(e) => setPlayerName(e.target.value)}
-                        style={{ padding: "10px", fontSize: "16px", marginRight: "10px", borderRadius: "5px", border: "1px solid #ccc" }}
-                    />
-                    <input
-                        type="text"
-                        placeholder="Raum-Code..."
-                        value={roomCode}
-                        onChange={(e) => setRoomCode(e.target.value)}
-                        style={{ padding: "10px", fontSize: "16px", marginRight: "10px", borderRadius: "5px", border: "1px solid #ccc" }}
-                    />
-                    <button type="submit" style={{ padding: "10px 20px", fontSize: "16px", cursor: "pointer", background: "#222", color: "#fff", border: "none", borderRadius: "5px" }}>
-                        Erstellen / Beitreten
-                    </button>
-                </form>
-
-                <div style={{ display: "flex", justifyContent: "center", gap: "40px", flexWrap: "wrap", maxWidth: "900px", margin: "0 auto" }}>
-
-                    {/* Linke Seite: Raumliste */}
-                    <div style={{ flex: 1, minWidth: "300px" }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                            <h3>Aktive Räume:</h3>
-                            <button onClick={triggerRefresh} style={{ padding: "5px 10px", cursor: "pointer", background: "#008CBA", color: "#fff", border: "none", borderRadius: "3px" }}>
-                                🔄 Aktualisieren
-                            </button>
-                        </div>
-                        {activeRooms.length === 0 ? (
-                            <p style={{ color: "#777", textAlign: "left" }}>Keine aktiven Räume. Erstelle einen!</p>
-                        ) : (
-                            <div style={{ background: "#f9f9f9", padding: "15px", borderRadius: "8px", border: "1px solid #ddd", textAlign: "left" }}>
-                                {activeRooms.map(r => (
-                                    <div key={r.code} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #eee" }}>
-                                        <div>
-                                            <strong>Raum: {r.code}</strong> <span style={{ fontSize: "12px", color: "#666" }}>({r.playerCount} im Raum)</span>
-                                            <div style={{ fontSize: "14px", color: "#555" }}>🦆 {r.entenName} vs. 🐌 {r.schneckenName}</div>
-                                        </div>
-                                        <button onClick={() => joinExistingRoom(r.code)} style={{ padding: "5px 10px", cursor: "pointer", background: "#4CAF50", color: "#fff", border: "none", borderRadius: "3px" }}>
-                                            Beitreten
-                                        </button>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Rechte Seite: Leaderboard */}
-                    <div style={{ width: "250px" }}>
-                        <h3>🏆 Top 5 Leaderboard</h3>
-                        <div style={{ background: "#fffdf3", padding: "15px", borderRadius: "8px", border: "1px solid #e2d19e", textAlign: "left" }}>
-                            {leaderboard.length === 0 ? (
-                                <p style={{ color: "#777", fontSize: "14px" }}>Noch keine Siege registriert.</p>
-                            ) : (
-                                <ol style={{ paddingLeft: "20px", margin: 0 }}>
-                                    {leaderboard.map((player, idx) => (
-                                        <li key={idx} style={{ padding: "4px 0", borderBottom: "1px solid #f3ebd4" }}>
-                                            <strong>{player.name}</strong>: {player.wins} {player.wins === 1 ? "Sieg" : "Siege"}
-                                        </li>
-                                    ))}
-                                </ol>
-                            )}
-                        </div>
-                    </div>
-
-                </div>
-            </div>
-        );
-    }
-
-    if (board.length === 0) return <div style={{ textAlign: "center", marginTop: "50px" }}>Lade...</div>;
-
-    // --- VIEW 2: Spielbrett ---
+    // --- Ansicht ---
     const squares = [];
     for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
@@ -258,13 +185,24 @@ function Board() {
 
     return (
         <div style={{ textAlign: "center", fontFamily: "sans-serif", marginTop: "20px" }}>
-            <div style={{ background: "#f0f0f0", padding: "10px", marginBottom: "15px", borderRadius: "5px", display: "inline-block", position: "relative" }}>
-                <button onClick={handleLeaveRoom} style={{ marginRight: "15px", padding: "3px 8px", cursor: "pointer", background: "#e74c3c", color: "white", border: "none", borderRadius: "3px" }}>
-                    🚪 Lobby
+            <h2>🦆 Enten gegen Schnecken 🐌 (Peer-to-Peer)</h2>
+
+            <div style={{ background: "#f0f0f0", padding: "15px", marginBottom: "15px", borderRadius: "5px", display: "inline-block" }}>
+                <p style={{ margin: "0 0 10px 0" }}>Deine ID: <b style={{ color: "green", userSelect: "all" }}>{myPeerId || "Generiere ID..."}</b></p>
+
+                <input
+                    type="text"
+                    placeholder="ID des Freundes einfügen"
+                    value={targetPeerId}
+                    onChange={(e) => setTargetPeerId(e.target.value)}
+                    style={{ padding: "5px", marginRight: "10px", width: "250px" }}
+                />
+                <button onClick={connectToFriend} style={{ padding: "5px 10px", cursor: "pointer" }}>
+                    Verbinden
                 </button>
-                <span>Raum: <strong>{roomCode}</strong> | Rolle: <strong>{myRole}</strong></span>
-                <div style={{ marginTop: "5px", fontWeight: "bold" }}>
-                    🦆 Enten: <span style={{ color: "#bda123" }}>{entenSpieler}</span> vs. 🐌 Schnecken: <span style={{ color: "#8b5a2b" }}>{schneckenSpieler}</span>
+
+                <div style={{ marginTop: "10px", fontWeight: "bold" }}>
+                    {conn ? <span style={{ color: "green" }}>⚡ Verbunden! Deine Rolle: {myRole}</span> : <span style={{ color: "orange" }}>Warte auf Verbindung...</span>}
                 </div>
             </div>
 
@@ -276,7 +214,7 @@ function Board() {
                     </button>
                 </div>
             ) : (
-                <h2 style={{ margin: "10px" }}>Am Zug: {isEntenTurn ? `Enten (${entenSpieler})` : `Schnecken (${schneckenSpieler})`}</h2>
+                <h2 style={{ margin: "10px" }}>Am Zug: {isEntenTurn ? "Enten 🦆" : "Schnecken 🐌"}</h2>
             )}
 
             <div style={{
@@ -293,5 +231,3 @@ function Board() {
         </div>
     );
 }
-
-export default Board;
